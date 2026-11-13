@@ -50,13 +50,20 @@ jobs:
             rel=$(jq -c ".[$i]" "$work/src.json")
             tag=$(jq -r '.tag_name' <<<"$rel")
 
+            title=$(jq -r '.name // ""' <<<"$rel")
+            jq -j '.body // ""' <<<"$rel" > "$work/body.md"   # 精确复制，不留多余换行
+
             if jq -e --arg t "$tag" 'any(.[]; .tag_name == $t)' "$work/dst.json" >/dev/null; then
-              echo "---- [$tag] already exists in target, skip"
+              cur=$(gh api "repos/$DST_REPO/releases/tags/$tag" --jq '.body // ""')
+              if [ "$cur" != "$(cat "$work/body.md")" ]; then
+                echo "---- [$tag] exists, notes differ -> repairing notes"
+                gh release edit "$tag" -R "$DST_REPO" --notes-file "$work/body.md"
+              else
+                echo "---- [$tag] already exists in target, skip"
+              fi
               continue
             fi
 
-            title=$(jq -r '.name // ""' <<<"$rel")
-            jq -r '.body // ""' <<<"$rel" > "$work/body.md"
             mkdir -p "$work/dl/$tag"
 
             echo "---- [$tag] creating release (title: $title)"
