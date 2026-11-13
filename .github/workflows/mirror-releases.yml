@@ -1,0 +1,88 @@
+name: Mirror NapCat releases
+
+# 把 XingYunStar/NapCatQQ 的全部 Release（含所有附件）复制到本仓库。
+# 手动触发：Actions 页面选本工作流 -> Run workflow -> 分支选 restore-releases。
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - restore-releases
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mirror-releases
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SRC_REPO: XingYunStar/NapCatQQ
+      DST_REPO: ${{ github.repository }}
+    steps:
+      - name: Show context
+        run: |
+          echo "source: $SRC_REPO"
+          echo "target: $DST_REPO"
+          df -h / | tail -1
+
+      - name: Mirror all releases
+        shell: bash
+        run: |
+          set -euo pipefail
+          work=$(mktemp -d)
+          echo "workdir: $work"
+
+          gh api "repos/$SRC_REPO/releases?per_page=100" --paginate > "$work/src.json"
+          src_count=$(jq 'length' "$work/src.json")
+          echo "== source releases: $src_count"
+
+          gh api "repos/$DST_REPO/releases?per_page=100" --paginate > "$work/dst.json" || echo '[]' > "$work/dst.json"
+          echo "== already in target:"
+          jq -r '.[].tag_name' "$work/dst.json" || true
+
+          for ((i = 0; i < src_count; i++)); do
+            rel=$(jq -c ".[$i]" "$work/src.json")
+            tag=$(jq -r '.tag_name' <<<"$rel")
+
+            if jq -e --arg t "$tag" 'any(.[]; .tag_name == $t)' "$work/dst.json" >/dev/null; then
+              echo "---- [$tag] already exists in target, skip"
+              continue
+            fi
+
+            title=$(jq -r '.name // ""' <<<"$rel")
+            jq -r '.body // ""' <<<"$rel" > "$work/body.md"
+            mkdir -p "$work/dl/$tag"
+
+            echo "---- [$tag] creating release (title: $title)"
+            args=(--title "$title" --notes-file "$work/body.md" --verify-tag)
+            if [ "$(jq -r '.prerelease' <<<"$rel")" = "true" ]; then args+=(--prerelease); fi
+            if [ "$(jq -r '.draft' <<<"$rel")" = "true" ]; then args+=(--draft); fi
+            gh release create "$tag" -R "$DST_REPO" "${args[@]}"
+
+            n=$(jq '.assets | length' <<<"$rel")
+            echo "---- [$tag] downloading $n assets"
+            if [ "$n" -gt 0 ]; then
+              gh release download "$tag" -R "$SRC_REPO" -D "$work/dl/$tag"
+
+              # 校验下载完整性与 sha256（源仓库提供 .sha256 附件时）
+              expected=$(jq -r '.assets[].size' <<<"$rel" | paste -sd+ | bc)
+              actual=$(find "$work/dl/$tag" -type f -printf '%s\n' | paste -sd+ | bc)
+              echo "---- [$tag] bytes expected=$expected actual=$actual"
+              [ "$expected" = "$actual" ] || { echo "!! size mismatch for $tag"; exit 1; }
+
+              echo "---- [$tag] uploading $n assets"
+              find "$work/dl/$tag" -maxdepth 1 -type f -print0 | xargs -0 gh release upload "$tag" -R "$DST_REPO"
+            fi
+            rm -rf "$work/dl/$tag"
+          done
+
+          echo "== verify target"
+          gh api "repos/$DST_REPO/releases?per_page=100" --paginate > "$work/dst2.json"
+          jq -r '.[] | "\(.tag_name)  assets=\(.assets|length)  bytes=\([.assets[].size]|add // 0)"' "$work/dst2.json"
+          echo "== done"
